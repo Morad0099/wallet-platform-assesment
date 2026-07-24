@@ -85,55 +85,118 @@ export class WalletsService {
     return wallet;
   }
 
-  async deposit(id: string, dto: DepositDto) {
-    const wallet = await this.walletModel.findByIdAndUpdate(
-      id,
-      { $inc: { balance: dto.amount } },
-      { new: true },
-    );
-
-    if (!wallet) {
-      throw new NotFoundException(`Wallet ${id} not found`);
-    }
-
-    const transaction = await this.transactionsService.create({
-      walletId: wallet.id,
-      type: TransactionType.DEPOSIT,
-      amount: dto.amount,
-      balanceAfter: wallet.balance,
-      reference: dto.reference,
-    });
-
-    await this.ledgerService.recordCredit(wallet._id, transaction._id, dto.amount, wallet.balance);
-
-    return wallet;
+async deposit(id: string, dto: DepositDto) {
+  const wallet = await this.walletModel.findById(id);
+  if (!wallet) {
+    throw new NotFoundException(`Wallet ${id} not found`);
   }
 
-  async withdraw(id: string, dto: WithdrawDto) {
-    const wallet = await this.walletModel.findById(id);
-    if (!wallet) {
-      throw new NotFoundException(`Wallet ${id} not found`);
-    }
+  const session = await this.connection.startSession();
+  let updatedWallet!: WalletDocument;
 
-    if (wallet.balance < dto.amount) {
-      throw new BadRequestException('Insufficient balance');
-    }
+  try {
+    await session.withTransaction(async () => {
+      const result = await this.walletModel.findOneAndUpdate(
+        {
+          _id: wallet._id,
+          version: wallet.version,
+        },
+        {
+          $inc: { balance: dto.amount, version: 1 },
+        },
+        {
+          new: true,
+          session,
+        }
+      );
 
-    wallet.balance -= dto.amount;
-    await wallet.save();
+      if (!result) {
+        throw new BadRequestException('Concurrent modification detected. Please retry.');
+      }
 
-    const transaction = await this.transactionsService.create({
-      walletId: wallet.id,
-      type: TransactionType.WITHDRAWAL,
-      amount: dto.amount,
-      balanceAfter: wallet.balance,
-      reference: dto.reference,
+      updatedWallet = result as WalletDocument;
+
+      const transaction = await this.transactionsService.create({
+        walletId: updatedWallet.id,
+        type: TransactionType.DEPOSIT,
+        amount: dto.amount,
+        balanceAfter: updatedWallet.balance,
+        reference: dto.reference,
+      });
+
+      await this.ledgerService.recordCredit(
+        updatedWallet._id,
+        transaction._id,
+        dto.amount,
+        updatedWallet.balance,
+        session,
+      );
     });
-
-    await this.ledgerService.recordDebit(wallet._id, transaction._id, dto.amount, wallet.balance);
-
-    return wallet;
+  } finally {
+    await session.endSession();
   }
+
+  return updatedWallet;
+}
+
+ async withdraw(id: string, dto: WithdrawDto) {
+  const wallet = await this.walletModel.findById(id);
+  if (!wallet) {
+    throw new NotFoundException(`Wallet ${id} not found`);
+  }
+
+  if (wallet.balance < dto.amount) {
+    throw new BadRequestException('Insufficient balance');
+  }
+
+  const session = await this.connection.startSession();
+  let updatedWallet!: WalletDocument;
+
+  try {
+    await session.withTransaction(async () => {
+      const result = await this.walletModel.findOneAndUpdate(
+        {
+          _id: wallet._id,
+          balance: { $gte: dto.amount },
+          version: wallet.version,
+        },
+        {
+          $inc: { balance: -dto.amount, version: 1 },
+        },
+        {
+          new: true,
+          session,
+        }
+      );
+
+      if (!result) {
+        throw new BadRequestException('Insufficient balance or concurrent modification');
+      }
+
+      updatedWallet = result as WalletDocument;
+
+      const transaction = await this.transactionsService.create({
+        walletId: updatedWallet.id,
+        type: TransactionType.WITHDRAWAL,
+        amount: dto.amount,
+        balanceAfter: updatedWallet.balance,
+        reference: dto.reference,
+      });
+
+      await this.ledgerService.recordDebit(
+        updatedWallet._id,
+        transaction._id,
+        dto.amount,
+        updatedWallet.balance,
+        session,
+      );
+    });
+  } finally {
+    await session.endSession();
+  }
+
+  return updatedWallet;
+}
 
 async transfer(dto: TransferDto) {
   if (dto.fromWalletId === dto.toWalletId) {
@@ -151,6 +214,7 @@ async transfer(dto: TransferDto) {
     }
   }
 
+  // Fetch wallets with current version
   const [fromWallet, toWallet] = await Promise.all([
     this.walletModel.findById(dto.fromWalletId),
     this.walletModel.findById(dto.toWalletId),
@@ -169,7 +233,46 @@ async transfer(dto: TransferDto) {
 
   try {
     await session.withTransaction(async () => {
-      // Create the transfer (unique index will prevent duplicates)
+      // Optimistic locking: Update sender with version check
+      const updatedFromWallet = await this.walletModel.findOneAndUpdate(
+        { 
+          _id: fromWallet._id, 
+          balance: { $gte: dto.amount },
+          version: fromWallet.version
+        },
+        { 
+          $inc: { balance: -dto.amount, version: 1 }
+        },
+        { 
+          new: true, 
+          session 
+        }
+      );
+
+      if (!updatedFromWallet) {
+        throw new BadRequestException('Insufficient balance or concurrent modification');
+      }
+
+      // Optimistic locking: Update receiver with version check
+      const updatedToWallet = await this.walletModel.findOneAndUpdate(
+        { 
+          _id: toWallet._id,
+          version: toWallet.version
+        },
+        { 
+          $inc: { balance: dto.amount, version: 1 }
+        },
+        { 
+          new: true, 
+          session 
+        }
+      );
+
+      if (!updatedToWallet) {
+        throw new Error('Failed to update receiver wallet');
+      }
+
+      // Create transfer record
       [transfer] = await this.transferModel.create(
         [
           {
@@ -183,9 +286,7 @@ async transfer(dto: TransferDto) {
         { session },
       );
 
-      fromWallet.balance -= dto.amount;
-      await fromWallet.save({ session });
-
+      // Create debit transaction for sender
       const [debitTransaction] = await this.transactionModel.create(
         [
           {
@@ -193,7 +294,7 @@ async transfer(dto: TransferDto) {
             type: TransactionType.TRANSFER_OUT,
             amount: dto.amount,
             status: TransactionStatus.COMPLETED,
-            balanceAfter: fromWallet.balance,
+            balanceAfter: updatedFromWallet.balance, // Use updated balance
             transferId: transfer._id,
             counterpartyWalletId: toWallet._id,
           },
@@ -201,34 +302,54 @@ async transfer(dto: TransferDto) {
         { session },
       );
 
+      // Create credit transaction for receiver
+      const [creditTransaction] = await this.transactionModel.create(
+        [
+          {
+            walletId: toWallet._id,
+            type: TransactionType.TRANSFER_IN,
+            amount: dto.amount,
+            status: TransactionStatus.COMPLETED,
+            balanceAfter: updatedToWallet.balance, // Use updated balance
+            transferId: transfer._id,
+            counterpartyWalletId: fromWallet._id,
+          },
+        ],
+        { session },
+      );
+
+      // Record ledger entries
       await this.ledgerService.recordDebit(
         fromWallet._id,
         debitTransaction._id,
         dto.amount,
-        fromWallet.balance,
+        updatedFromWallet.balance,
         session,
       );
 
+      await this.ledgerService.recordCredit(
+        toWallet._id,
+        creditTransaction._id,
+        dto.amount,
+        updatedToWallet.balance,
+        session,
+      );
+
+      // Enqueue outbox event
       await this.outboxService.enqueue(
-              'transfer.initiated',
-              {
-                transferId: transfer._id.toString(),
-                fromWalletId: fromWallet._id.toString(),
-                toWalletId: toWallet._id.toString(),
-                amount: dto.amount,
-              },
-              session,
-            );
+        'transfer.initiated',
+        {
+          transferId: transfer._id.toString(),
+          fromWalletId: fromWallet._id.toString(),
+          toWalletId: toWallet._id.toString(),
+          amount: dto.amount,
+        },
+        session,
+      );
     });
-  } catch (error) {
+  } catch (error: any) {
     // Handle duplicate key error gracefully
-    if (
-      error &&
-      typeof error === 'object' &&
-      'code' in error &&
-      (error as { code?: number }).code === 11000 &&
-      dto.idempotencyKey
-    ) {
+    if (error.code === 11000 && dto.idempotencyKey) {
       const existing = await this.transferModel.findOne({
         idempotencyKey: dto.idempotencyKey,
       });
