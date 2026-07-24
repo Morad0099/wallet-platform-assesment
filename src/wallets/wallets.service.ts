@@ -209,12 +209,16 @@ async transfer(dto: TransferDto) {
         session,
       );
 
-      await this.rabbitMQService.publish('transfer.initiated', {
-        transferId: transfer._id.toString(),
-        fromWalletId: fromWallet._id.toString(),
-        toWalletId: toWallet._id.toString(),
-        amount: dto.amount,
-      });
+      await this.outboxService.enqueue(
+              'transfer.initiated',
+              {
+                transferId: transfer._id.toString(),
+                fromWalletId: fromWallet._id.toString(),
+                toWalletId: toWallet._id.toString(),
+                amount: dto.amount,
+              },
+              session,
+            );
     });
   } catch (error) {
     // Handle duplicate key error gracefully

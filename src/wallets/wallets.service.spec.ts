@@ -284,12 +284,18 @@ describe('WalletsService', () => {
         70,
         mockSession,
       );
-      expect(rabbitMQService.publish).toHaveBeenCalledWith(
-        'transfer.initiated',
-        expect.objectContaining({ transferId: createdTransfer._id.toString(), amount: 30 }),
-      );
-      expect(result).toBe(createdTransfer);
-    });
+     expect(outboxService.enqueue).toHaveBeenCalledWith(
+      'transfer.initiated',
+      expect.objectContaining({ 
+        transferId: createdTransfer._id.toString(), 
+        amount: 30 
+      }),
+      mockSession,
+    );
+    expect(rabbitMQService.publish).not.toHaveBeenCalled();
+    expect(result).toBe(createdTransfer);
+  });
+
 
     it('does not create a second transfer when retried with the same idempotency key', async () => {
       const { fromWallet } = mockWallets(100);
