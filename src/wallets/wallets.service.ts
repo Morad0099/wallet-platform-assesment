@@ -135,81 +135,110 @@ export class WalletsService {
     return wallet;
   }
 
-  async transfer(dto: TransferDto) {
-    if (dto.fromWalletId === dto.toWalletId) {
-      throw new BadRequestException('Cannot transfer to the same wallet');
-    }
-
-    const [fromWallet, toWallet] = await Promise.all([
-      this.walletModel.findById(dto.fromWalletId),
-      this.walletModel.findById(dto.toWalletId),
-    ]);
-
-    if (!fromWallet || !toWallet) {
-      throw new NotFoundException('Wallet not found');
-    }
-
-    if (fromWallet.balance < dto.amount) {
-      throw new BadRequestException('Insufficient balance');
-    }
-
-    const session = await this.connection.startSession();
-    let transfer!: TransferDocument;
-
-    try {
-      await session.withTransaction(async () => {
-        [transfer] = await this.transferModel.create(
-          [
-            {
-              fromWalletId: fromWallet._id,
-              toWalletId: toWallet._id,
-              amount: dto.amount,
-              status: TransferStatus.PENDING,
-              idempotencyKey: dto.idempotencyKey,
-            },
-          ],
-          { session },
-        );
-
-        fromWallet.balance -= dto.amount;
-        await fromWallet.save({ session });
-
-        const [debitTransaction] = await this.transactionModel.create(
-          [
-            {
-              walletId: fromWallet._id,
-              type: TransactionType.TRANSFER_OUT,
-              amount: dto.amount,
-              status: TransactionStatus.COMPLETED,
-              balanceAfter: fromWallet.balance,
-              transferId: transfer._id,
-              counterpartyWalletId: toWallet._id,
-            },
-          ],
-          { session },
-        );
-
-        await this.ledgerService.recordDebit(
-          fromWallet._id,
-          debitTransaction._id,
-          dto.amount,
-          fromWallet.balance,
-          session,
-        );
-
-        await this.rabbitMQService.publish('transfer.initiated', {
-          transferId: transfer._id.toString(),
-          fromWalletId: fromWallet._id.toString(),
-          toWalletId: toWallet._id.toString(),
-          amount: dto.amount,
-        });
-      });
-    } finally {
-      await session.endSession();
-    }
-
-    return transfer;
+async transfer(dto: TransferDto) {
+  if (dto.fromWalletId === dto.toWalletId) {
+    throw new BadRequestException('Cannot transfer to the same wallet');
   }
+
+  // Check if transfer already exists with this idempotency key
+  if (dto.idempotencyKey) {
+    const existingTransfer = await this.transferModel.findOne({
+      idempotencyKey: dto.idempotencyKey,
+    });
+    
+    if (existingTransfer) {
+      return existingTransfer;
+    }
+  }
+
+  const [fromWallet, toWallet] = await Promise.all([
+    this.walletModel.findById(dto.fromWalletId),
+    this.walletModel.findById(dto.toWalletId),
+  ]);
+
+  if (!fromWallet || !toWallet) {
+    throw new NotFoundException('Wallet not found');
+  }
+
+  if (fromWallet.balance < dto.amount) {
+    throw new BadRequestException('Insufficient balance');
+  }
+
+  const session = await this.connection.startSession();
+  let transfer!: TransferDocument;
+
+  try {
+    await session.withTransaction(async () => {
+      // Create the transfer (unique index will prevent duplicates)
+      [transfer] = await this.transferModel.create(
+        [
+          {
+            fromWalletId: fromWallet._id,
+            toWalletId: toWallet._id,
+            amount: dto.amount,
+            status: TransferStatus.PENDING,
+            idempotencyKey: dto.idempotencyKey,
+          },
+        ],
+        { session },
+      );
+
+      fromWallet.balance -= dto.amount;
+      await fromWallet.save({ session });
+
+      const [debitTransaction] = await this.transactionModel.create(
+        [
+          {
+            walletId: fromWallet._id,
+            type: TransactionType.TRANSFER_OUT,
+            amount: dto.amount,
+            status: TransactionStatus.COMPLETED,
+            balanceAfter: fromWallet.balance,
+            transferId: transfer._id,
+            counterpartyWalletId: toWallet._id,
+          },
+        ],
+        { session },
+      );
+
+      await this.ledgerService.recordDebit(
+        fromWallet._id,
+        debitTransaction._id,
+        dto.amount,
+        fromWallet.balance,
+        session,
+      );
+
+      await this.rabbitMQService.publish('transfer.initiated', {
+        transferId: transfer._id.toString(),
+        fromWalletId: fromWallet._id.toString(),
+        toWalletId: toWallet._id.toString(),
+        amount: dto.amount,
+      });
+    });
+  } catch (error) {
+    // Handle duplicate key error gracefully
+    if (
+      error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: number }).code === 11000 &&
+      dto.idempotencyKey
+    ) {
+      const existing = await this.transferModel.findOne({
+        idempotencyKey: dto.idempotencyKey,
+      });
+      if (existing) {
+        return existing;
+      }
+    }
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+
+  return transfer;
+}
 
   async getDashboard(id: string) {
     const wallet = await this.walletModel.findById(id);

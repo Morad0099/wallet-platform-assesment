@@ -23,7 +23,11 @@ export class Transfer {
   @Prop({ type: String, enum: TransferStatus, default: TransferStatus.PENDING })
   status: TransferStatus;
 
-  @Prop()
+  @Prop({
+    unique: true,
+    index: true,
+    sparse: true, // Allows multiple null values, but unique for actual keys
+  })
   idempotencyKey?: string;
 
   @Prop()

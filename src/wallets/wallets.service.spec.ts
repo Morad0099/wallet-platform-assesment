@@ -292,8 +292,13 @@ describe('WalletsService', () => {
     });
 
     it('does not create a second transfer when retried with the same idempotency key', async () => {
-      mockWallets(100);
+      const { fromWallet } = mockWallets(100);
       const createdTransfer = { _id: new Types.ObjectId(), status: 'PENDING' };
+      
+      transferModel.findOne
+        .mockResolvedValueOnce(null)  
+        .mockResolvedValueOnce(createdTransfer);
+      
       transferModel.create.mockResolvedValue([createdTransfer]);
       transactionModel.create.mockResolvedValue([{ _id: new Types.ObjectId() }]);
 
@@ -305,9 +310,14 @@ describe('WalletsService', () => {
       };
 
       await service.transfer(dto);
-      await service.transfer(dto);
+      
+      const result = await service.transfer(dto);
 
       expect(transferModel.create).toHaveBeenCalledTimes(1);
+      
+      expect(transferModel.findOne).toHaveBeenCalledTimes(2);
+      
+      expect(result).toBe(createdTransfer);
     });
 
     it('ends the Mongo session even when the transaction fails partway through', async () => {
