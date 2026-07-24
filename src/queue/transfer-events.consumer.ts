@@ -53,48 +53,99 @@ export class TransferEventsConsumer implements OnModuleInit {
       channel.ack(message);
     } catch (error) {
       this.logger.error(`Failed to process transfer event: ${(error as Error).message}`);
-      channel.ack(message);
+      
+      // Requeue for retry instead of dropping
+      channel.nack(message, false, true); // Requeue the message
     }
   }
 
-  private async completeTransfer(event: TransferInitiatedEvent) {
-    const transfer = await this.transferModel.findById(event.transferId);
-    if (!transfer) {
-      this.logger.warn(`Transfer ${event.transferId} not found, skipping`);
-      return;
-    }
+ private async completeTransfer(event: TransferInitiatedEvent) {
+  const transfer = await this.transferModel.findById(event.transferId);
+  if (!transfer) {
+    this.logger.warn(`Transfer ${event.transferId} not found, skipping`);
+    return;
+  }
 
-    const toWallet = await this.walletModel.findById(event.toWalletId);
-    if (!toWallet) {
-      this.logger.warn(`Destination wallet ${event.toWalletId} not found, skipping`);
-      return;
-    }
+  // Idempotency: If already completed, skip
+  if (transfer.status === TransferStatus.COMPLETED) {
+    this.logger.log(`Transfer ${event.transferId} already completed, skipping`);
+    return;
+  }
 
-    toWallet.balance += event.amount;
-    await toWallet.save();
+  if (transfer.status === TransferStatus.FAILED) {
+    this.logger.log(`Transfer ${event.transferId} already failed, skipping`);
+    return;
+  }
 
-    const [creditTransaction] = await this.transactionModel.create([
-      {
-        walletId: toWallet._id,
-        type: TransactionType.TRANSFER_IN,
-        amount: event.amount,
-        status: TransactionStatus.COMPLETED,
-        balanceAfter: toWallet.balance,
-        transferId: transfer._id,
-        counterpartyWalletId: transfer.fromWalletId,
-      },
-    ]);
-
-    await this.ledgerService.recordCredit(
-      toWallet._id,
-      creditTransaction._id,
-      event.amount,
-      toWallet.balance,
-    );
-
-    transfer.status = TransferStatus.COMPLETED;
+  const toWallet = await this.walletModel.findById(event.toWalletId);
+  if (!toWallet) {
+    transfer.status = TransferStatus.FAILED;
+    transfer.failureReason = `Destination wallet ${event.toWalletId} not found`;
     await transfer.save();
-
-    this.logger.log(`Transfer ${transfer.id} completed for wallet ${toWallet.id}`);
+    throw new Error(`Destination wallet not found`);
   }
+
+  // Use the connection from the model
+  const session = await this.walletModel.db.startSession();
+  
+  try {
+    await session.withTransaction(async () => {
+      // Optimistic locking for receiver
+      const updatedWallet = await this.walletModel.findOneAndUpdate(
+        {
+          _id: toWallet._id,
+          version: toWallet.version,
+        },
+        {
+          $inc: { balance: event.amount, version: 1 },
+        },
+        {
+          new: true,
+          session,
+        }
+      );
+
+      if (!updatedWallet) {
+        throw new Error('Concurrent modification detected on receiver wallet');
+      }
+
+      // Create credit transaction
+      const [creditTransaction] = await this.transactionModel.create(
+        [
+          {
+            walletId: toWallet._id,
+            type: TransactionType.TRANSFER_IN,
+            amount: event.amount,
+            status: TransactionStatus.COMPLETED,
+            balanceAfter: updatedWallet.balance,
+            transferId: transfer._id,
+            counterpartyWalletId: transfer.fromWalletId,
+          },
+        ],
+        { session },
+      );
+
+      await this.ledgerService.recordCredit(
+        toWallet._id,
+        creditTransaction._id,
+        event.amount,
+        updatedWallet.balance,
+        session,
+      );
+
+      // Mark transfer as COMPLETED
+      transfer.status = TransferStatus.COMPLETED;
+      await transfer.save({ session });
+    });
+  } catch (error) {
+    transfer.status = TransferStatus.FAILED;
+    transfer.failureReason = (error as Error).message;
+    await transfer.save();
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+
+  this.logger.log(`Transfer ${transfer.id} completed for wallet ${toWallet.id}`);
+}
 }
